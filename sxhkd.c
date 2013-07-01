@@ -13,7 +13,9 @@
 #include <signal.h>
 #include <stdbool.h>
 #include "helpers.h"
-#include "hotkeys.h"
+#include "types.h"
+#include "parse.h"
+#include "grab.h"
 #include "sxhkd.h"
 
 void hold(int sig)
@@ -22,6 +24,8 @@ void hold(int sig)
         running = false;
     else if (sig == SIGUSR1)
         reload = true;
+    else if (sig == SIGALRM)
+        bell = true;
 }
 
 void setup(void)
@@ -36,24 +40,26 @@ void setup(void)
     if ((shell = getenv(SXHKD_SHELL_ENV)) == NULL && (shell = getenv(SHELL_ENV)) == NULL)
         err("The '%s' environment variable is not defined.\n", SHELL_ENV);
     symbols = xcb_key_symbols_alloc(dpy);
-    hotkeys = NULL;
+    hotkeys = hotkeys_tail = NULL;
 }
 
 void cleanup(void)
 {
+    PUTS("cleanup");
     hotkey_t *hk = hotkeys;
     while (hk != NULL) {
         hotkey_t *tmp = hk->next;
+        destroy_chain(hk->chain);
         free(hk);
         hk = tmp;
     }
+    hotkeys = hotkeys_tail = NULL;
 }
 
 void reload_cmd(void)
 {
     PUTS("reload");
     cleanup();
-    hotkeys = NULL;
     load_config(config_file);
     for (int i = 0; i < num_extra_confs; i++)
         load_config(extra_confs[i]);
@@ -61,97 +67,19 @@ void reload_cmd(void)
     grab();
 }
 
-void load_config(char *config_file)
-{
-    PRINTF("load configuration '%s'\n", config_file);
-
-
-    FILE *cfg = fopen(config_file, "r");
-    if (cfg == NULL)
-        err("Can't open configuration file: '%s'.\n", config_file);
-
-    char line[MAXLEN];
-    xcb_keysym_t keysym = XCB_NO_SYMBOL;
-    xcb_button_t button = XCB_NONE;
-    uint16_t modfield = 0;
-    uint8_t event_type = XCB_KEY_PRESS;
-    bool replay_event = false;
-    char folded_hotkey[MAXLEN] = {'\0'};
-
-    while (fgets(line, sizeof(line), cfg) != NULL) {
-        if (strlen(line) < 2 || line[0] == START_COMMENT) {
-            continue;
-        } else if (isspace(line[0])) {
-            if (keysym == XCB_NO_SYMBOL && button == XCB_NONE && strlen(folded_hotkey) == 0)
-                continue;
-            unsigned int i = strlen(line) - 1;
-            while (i > 0 && isspace(line[i]))
-                line[i--] = '\0';
-            i = 1;
-            while (i < strlen(line) && isspace(line[i]))
-                i++;
-            if (i < strlen(line)) {
-                char *command = line + i;
-                if (strlen(folded_hotkey) == 0)
-                    generate_hotkeys(keysym, button, modfield, event_type, replay_event, command);
-                else
-                    unfold_hotkeys(folded_hotkey, command);
-            }
-            keysym = XCB_NO_SYMBOL;
-            button = XCB_NONE;
-            modfield = 0;
-            event_type = XCB_KEY_PRESS;
-            replay_event = false;
-            folded_hotkey[0] = '\0';
-        } else {
-            unsigned int i = strlen(line) - 1;
-            while (i > 0 && isspace(line[i]))
-                line[i--] = '\0';
-            if (!parse_fold(line, folded_hotkey))
-                parse_hotkey(line, &keysym, &button, &modfield, &event_type, &replay_event);
-        }
-    }
-
-    fclose(cfg);
-}
-
 void key_button_event(xcb_generic_event_t *evt, uint8_t event_type)
 {
     xcb_keysym_t keysym = XCB_NO_SYMBOL;
-    xcb_keycode_t keycode = XCB_NONE;
     xcb_button_t button = XCB_NONE;
     bool replay_event = false;
     uint16_t modfield = 0;
     uint16_t lockfield = num_lock | caps_lock | scroll_lock;
-    if (event_type == XCB_KEY_PRESS) {
-        xcb_key_press_event_t *e = (xcb_key_press_event_t *) evt;
-        keycode = e->detail;
-        modfield = e->state;
-        keysym = xcb_key_symbols_get_keysym(symbols, keycode, 0);
-        PRINTF("key press %u %u\n", keycode, modfield);
-    } else if (event_type == XCB_KEY_RELEASE) {
-        xcb_key_release_event_t *e = (xcb_key_release_event_t *) evt;
-        keycode = e->detail;
-        modfield = e->state;
-        keysym = xcb_key_symbols_get_keysym(symbols, keycode, 0);
-        PRINTF("key release %u %u\n", keycode, modfield);
-    } else if (event_type == XCB_BUTTON_PRESS) {
-        xcb_button_press_event_t *e = (xcb_button_press_event_t *) evt;
-        button = e->detail;
-        modfield = e->state;
-        PRINTF("button press %u %u\n", button, modfield);
-    } else if (event_type == XCB_BUTTON_RELEASE) {
-        xcb_button_release_event_t *e = (xcb_button_release_event_t *) evt;
-        button = e->detail;
-        modfield = e->state;
-        PRINTF("button release %u %u\n", button, modfield);
-    }
+    parse_event(evt, event_type, &keysym, &button, &modfield);
     modfield &= ~lockfield & MOD_STATE_FIELD;
     if (keysym != XCB_NO_SYMBOL || button != XCB_NONE) {
-        hotkey_t *hk = find_hotkey(keysym, button, modfield, event_type);
+        hotkey_t *hk = find_hotkey(keysym, button, modfield, event_type, &replay_event);
         if (hk != NULL) {
             run(hk->command);
-            replay_event = hk->replay_event;
         }
     }
     switch (event_type) {
@@ -160,14 +88,14 @@ void key_button_event(xcb_generic_event_t *evt, uint8_t event_type)
             if (replay_event)
                 xcb_allow_events(dpy, XCB_ALLOW_REPLAY_POINTER, XCB_CURRENT_TIME);
             else
-                xcb_allow_events(dpy, XCB_ALLOW_ASYNC_POINTER, XCB_CURRENT_TIME);
+                xcb_allow_events(dpy, XCB_ALLOW_SYNC_POINTER, XCB_CURRENT_TIME);
             break;
         case XCB_KEY_PRESS:
         case XCB_KEY_RELEASE:
             if (replay_event)
                 xcb_allow_events(dpy, XCB_ALLOW_REPLAY_KEYBOARD, XCB_CURRENT_TIME);
             else
-                xcb_allow_events(dpy, XCB_ALLOW_ASYNC_KEYBOARD, XCB_CURRENT_TIME);
+                xcb_allow_events(dpy, XCB_ALLOW_SYNC_KEYBOARD, XCB_CURRENT_TIME);
             break;
     }
     xcb_flush(dpy);
@@ -185,7 +113,7 @@ void motion_notify(xcb_generic_event_t *evt, uint8_t event_type)
         buttonfield = buttonfield >> 1;
         button++;
     }
-    hotkey_t *hk = find_hotkey(XCB_NO_SYMBOL, button, modfield, event_type);
+    hotkey_t *hk = find_hotkey(XCB_NO_SYMBOL, button, modfield, event_type, NULL);
     if (hk != NULL) {
         char command[MAXLEN];
         snprintf(command, sizeof(command), hk->command, e->root_x, e->root_y);
@@ -197,16 +125,20 @@ int main(int argc, char *argv[])
 {
     char opt;
     config_path = NULL;
+    timeout = TIMEOUT;
 
-    while ((opt = getopt(argc, argv, "vhc:r:")) != -1) {
+    while ((opt = getopt(argc, argv, "vht:c:r:")) != -1) {
         switch (opt) {
             case 'v':
                 printf("%s\n", VERSION);
                 exit(EXIT_SUCCESS);
                 break;
             case 'h':
-                printf("sxhkd [-h|-v|-c CONFIG_FILE|-r REDIR_FILE] [EXTRA_CONFIG ...]\n");
+                printf("sxhkd [-h|-v|-t TIMEOUT|-c CONFIG_FILE|-r REDIR_FILE] [EXTRA_CONFIG ...]\n");
                 exit(EXIT_SUCCESS);
+                break;
+            case 't':
+                timeout = atoi(optarg);
                 break;
             case 'r':
                 redir_fd = open(optarg, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
@@ -236,6 +168,7 @@ int main(int argc, char *argv[])
     signal(SIGHUP, hold);
     signal(SIGTERM, hold);
     signal(SIGUSR1, hold);
+    signal(SIGALRM, hold);
 
     setup();
     get_standard_keysyms();
@@ -250,7 +183,7 @@ int main(int argc, char *argv[])
 
     fd_set descriptors;
 
-    reload = false;
+    reload = bell = chained = false;
     running = true;
 
     xcb_flush(dpy);
@@ -284,6 +217,12 @@ int main(int argc, char *argv[])
             signal(SIGUSR1, hold);
             reload_cmd();
             reload = false;
+        }
+
+        if (bell) {
+            signal(SIGALRM, hold);
+            abort_chain();
+            bell = false;
         }
 
         if (xcb_connection_has_error(dpy)) {
