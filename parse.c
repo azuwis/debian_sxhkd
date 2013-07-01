@@ -1,10 +1,10 @@
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
+#include <inttypes.h>
+#include <ctype.h>
 #include "locales.h"
-#include "hotkeys.h"
-#include "helpers.h"
-#include "sxhkd.h"
+#include "types.h"
+#include "parse.h"
 
 keysym_dict_t nks_dict[] = {/*{{{*/
     {"VoidSymbol"                  , 0xffffff}   ,
@@ -2338,152 +2338,304 @@ keysym_dict_t nks_dict[] = {/*{{{*/
 #endif
 };/*}}}*/
 
-void grab(void)
+void load_config(char *config_file)
 {
-    PUTS("grab");
-    for (hotkey_t *hk = hotkeys; hk != NULL; hk = hk->next) {
-        if (hk->button == XCB_NONE) {
-            xcb_keycode_t *keycodes = keycodes_from_keysym(hk->keysym);
-            if (keycodes != NULL)
-                for (xcb_keycode_t *kc = keycodes; *kc != XCB_NO_SYMBOL; kc++)
-                    if (hk->keysym == xcb_key_symbols_get_keysym(symbols, *kc, 0)) {
-                        PRINTF("keycode for %u is %u\n", hk->keysym, *kc);
-                        grab_key_button(*kc, hk->button, hk->modfield);
-                    }
-            free(keycodes);
+    PRINTF("load configuration '%s'\n", config_file);
+    FILE *cfg = fopen(config_file, "r");
+    if (cfg == NULL)
+        err("Can't open configuration file: '%s'.\n", config_file);
+
+    char buf[MAXLEN];
+    char chain[MAXLEN] = {0};
+    char command[MAXLEN] = {0};
+    int offset = 0;
+    char first;
+
+    while (fgets(buf, sizeof(buf), cfg) != NULL) {
+        first = buf[0];
+        if (strlen(buf) < 2 || first == START_COMMENT) {
+            continue;
         } else {
-            grab_key_button(XCB_NONE, hk->button, hk->modfield);
+            char *start = lgraph(buf);
+            if (start == NULL)
+                continue;
+            char *end = rgraph(buf);
+            *(end + 1) = '\0';
+
+            if (isgraph(first))
+                strncpy(chain + offset, start, sizeof(chain) - offset);
+            else
+                strncpy(command + offset, start, sizeof(command) - offset);
+
+            if (*end == PARTIAL_LINE) {
+                offset += end - start;
+                continue;
+            } else {
+                offset = 0;
+            }
+
+            if (isspace(first) && strlen(chain) > 0 && strlen(command) > 0) {
+                process_hotkey(chain, command);
+                chain[0] = '\0';
+                command[0] = '\0';
+            }
         }
+    }
+
+    fclose(cfg);
+}
+
+void parse_event(xcb_generic_event_t *evt, uint8_t event_type, xcb_keysym_t *keysym, xcb_button_t *button, uint16_t *modfield) {
+    if (event_type == XCB_KEY_PRESS) {
+        xcb_key_press_event_t *e = (xcb_key_press_event_t *) evt;
+        xcb_keycode_t keycode = e->detail;
+        *modfield = e->state;
+        *keysym = xcb_key_symbols_get_keysym(symbols, keycode, 0);
+        PRINTF("key press %u %u\n", keycode, *modfield);
+    } else if (event_type == XCB_KEY_RELEASE) {
+        xcb_key_release_event_t *e = (xcb_key_release_event_t *) evt;
+        xcb_keycode_t keycode = e->detail;
+        *modfield = e->state & ~modfield_from_keycode(keycode);
+        *keysym = xcb_key_symbols_get_keysym(symbols, keycode, 0);
+        PRINTF("key release %u %u\n", keycode, *modfield);
+    } else if (event_type == XCB_BUTTON_PRESS) {
+        xcb_button_press_event_t *e = (xcb_button_press_event_t *) evt;
+        *button = e->detail;
+        *modfield = e->state;
+        PRINTF("button press %u %u\n", *button, *modfield);
+    } else if (event_type == XCB_BUTTON_RELEASE) {
+        xcb_button_release_event_t *e = (xcb_button_release_event_t *) evt;
+        *button = e->detail;
+        *modfield = e->state;
+        PRINTF("button release %u %u\n", *button, *modfield);
     }
 }
 
-void grab_key_button(xcb_keycode_t keycode, xcb_button_t button, uint16_t modfield)
+void process_hotkey(char *hotkey_string, char *command_string)
 {
-    grab_key_button_checked(keycode, button, modfield);
-    if (num_lock != 0)
-        grab_key_button_checked(keycode, button, modfield | num_lock);
-    if (caps_lock != 0)
-        grab_key_button_checked(keycode, button, modfield | caps_lock);
-    if (scroll_lock != 0)
-        grab_key_button_checked(keycode, button, modfield | scroll_lock);
-    if (num_lock != 0 && caps_lock != 0)
-        grab_key_button_checked(keycode, button, modfield | num_lock | caps_lock);
-    if (caps_lock != 0 && scroll_lock != 0)
-        grab_key_button_checked(keycode, button, modfield | caps_lock | scroll_lock);
-    if (num_lock != 0 && scroll_lock != 0)
-        grab_key_button_checked(keycode, button, modfield | num_lock | scroll_lock);
-    if (num_lock != 0 && caps_lock != 0 && scroll_lock != 0)
-        grab_key_button_checked(keycode, button, modfield | num_lock | caps_lock | scroll_lock);
+    char hotkey[MAXLEN] = {0};
+    char command[MAXLEN] = {0};
+    chunk_t *hk_chunks = extract_chunks(hotkey_string);
+    chunk_t *cm_chunks = extract_chunks(command_string);
+    if (hk_chunks == NULL)
+        strncpy(hotkey, hotkey_string, sizeof(hotkey));
+    if (cm_chunks == NULL)
+        strncpy(command, command_string, sizeof(command));
+    render_next(hk_chunks, hotkey);
+    render_next(cm_chunks, command);
+
+    while ((hk_chunks == NULL || hotkey[0] != '\0') && (cm_chunks == NULL || command[0] != '\0')) {
+
+        PRINTF("%s: %s\n", hotkey, command);
+        chain_t *chain = make_chain();
+        if (parse_chain(hotkey, chain)) {
+            hotkey_t *hk = make_hotkey(chain, command);
+            add_hotkey(hk);
+        } else {
+            free(chain);
+        }
+
+        if (hk_chunks == NULL && cm_chunks == NULL)
+            break;
+
+        render_next(hk_chunks, hotkey);
+        render_next(cm_chunks, command);
+    }
+    if (hk_chunks != NULL)
+        destroy_chunks(hk_chunks);
+    if (cm_chunks != NULL)
+        destroy_chunks(cm_chunks);
 }
 
-void grab_key_button_checked(xcb_keycode_t keycode, xcb_button_t button, uint16_t modfield)
+char *get_token(char *dst, char *src, char *sep)
 {
-    xcb_generic_error_t *err;
-    if (button == XCB_NONE)
-        err = xcb_request_check(dpy, xcb_grab_key_checked(dpy, true, root, modfield, keycode, XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_SYNC));
-    else
-        err = xcb_request_check(dpy, xcb_grab_button_checked(dpy, true, root, XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION, XCB_GRAB_MODE_SYNC, XCB_GRAB_MODE_ASYNC, XCB_NONE, XCB_NONE, button, modfield));
-    unsigned int value = (button == XCB_NONE ? keycode : button);
-    char *type = (button == XCB_NONE ? "key" : "button");
-    if (err != NULL) {
-        warn("Could not grab %s %u with modfield %u: ", type, value, modfield);
-        if (err->error_code == XCB_ACCESS)
-            warn("the combination is already grabbed.\n");
-        else
-            warn("error no %u encountered.\n", err->error_code);
-        free(err);
+    size_t len = strlen(src);
+    unsigned int i = 0, j = 0;
+    bool inhibit = false;
+    bool found = false;
+    while (i < len && !found) {
+        if (inhibit) {
+            dst[j++] = src[i];
+            inhibit = false;
+        } else if (src[i] == MAGIC_INHIBIT) {
+            inhibit = true;
+            if (src[i+1] != MAGIC_INHIBIT && strchr(sep, src[i+1]) == NULL)
+                dst[j++] = src[i];
+        } else if (strchr(sep, src[i]) != NULL) {
+            if (j > 0)
+                found = true;
+            do {
+                i++;
+            } while (i < len && strchr(sep, src[i]) != NULL);
+            i--;
+        } else {
+            dst[j++] = src[i];
+        }
+        i++;
+    }
+    dst[j] = '\0';
+    return src + i;
+}
+
+void render_next(chunk_t *chunks, char *dest)
+{
+    if (chunks == NULL)
+        return;
+    int i = 0;
+    bool incr = false;
+    for (chunk_t *c = chunks; c != NULL; c = c->next) {
+        if (c->sequence) {
+            if (!incr) {
+                if (c->range_cur < c->range_max) {
+                    c->range_cur++;
+                    incr = true;
+                } else {
+                    c->range_cur = 1, c->range_max = 0;
+                }
+            }
+            if (c->advance == NULL) {
+                incr = true;
+                c->advance = get_token(c->item, c->text, SEQ_SEP);
+            } else if (!incr && c->range_cur > c->range_max) {
+                if (c->advance[0] == '\0') {
+                    c->advance = get_token(c->item, c->text, SEQ_SEP);
+                } else {
+                    c->advance = get_token(c->item, c->advance, SEQ_SEP);
+                    incr = true;
+                }
+            }
+            if (c->range_cur > c->range_max && strlen(c->item) == 3)
+                sscanf(c->item, "%c-%c", &c->range_cur, &c->range_max);
+            if (c->range_cur <= c->range_max) {
+                dest[i++] = c->range_cur;
+            } else {
+                if (c->item[0] == SEQ_NONE && c->item[1] == '\0')
+                    continue;
+                strcpy(dest + i, c->item);
+                i += strlen(c->item);
+            }
+        } else {
+            strcpy(dest + i, c->text);
+            i += strlen(c->text);
+        }
+    }
+    dest[i] = '\0';
+    if (!incr)
+        dest[0] = '\0';
+}
+
+chunk_t *extract_chunks(char *s)
+{
+    size_t len = strlen(s);
+    unsigned int i = 0, j = 0;
+    bool inhibit = false;
+    int num_seq = 0;
+    chunk_t *c = make_chunk();
+    chunk_t *head = c;
+    while (i < len) {
+        if (inhibit) {
+            c->text[j++] = s[i];
+            inhibit = false;
+        } else if (s[i] == MAGIC_INHIBIT) {
+            inhibit = true;
+            if ((s[i+1] != MAGIC_INHIBIT || c->sequence)
+                    && s[i+1] != SEQ_BEGIN
+                    && s[i+1] != SEQ_END)
+                c->text[j++] = s[i];
+        } else if (s[i] == SEQ_BEGIN) {
+            if (j > 0) {
+                c->text[j] = '\0';
+                j = 0;
+                chunk_t *next = make_chunk();
+                c->next = next;
+                c = next;
+            }
+            c->sequence = true;
+        } else if (s[i] == SEQ_END) {
+            if (c->sequence)
+                num_seq++;
+            if (j > 0) {
+                c->text[j] = '\0';
+                j = 0;
+                chunk_t *next = make_chunk();
+                c->next = next;
+                c = next;
+            }
+            c->sequence = false;
+        } else {
+            c->text[j++] = s[i];
+        }
+        i++;
+    }
+    c->text[j] = '\0';
+    if (num_seq == 0) {
+        destroy_chunks(head);
+        return NULL;
     } else {
-        PRINTF("grab %s %u %u\n", type, value, modfield);
+        return head;
     }
 }
 
-void ungrab(void)
+chunk_t *make_chunk(void)
 {
-    PUTS("ungrab");
-    xcb_ungrab_key(dpy, XCB_GRAB_ANY, root, XCB_BUTTON_MASK_ANY);
-    xcb_ungrab_button(dpy, XCB_BUTTON_INDEX_ANY, root, XCB_MOD_MASK_ANY);
+    chunk_t *c = malloc(sizeof(chunk_t));
+    c->sequence = false;
+    c->advance = NULL;
+    c->next = NULL;
+    c->range_cur = 1;
+    c->range_max = 0;
+    return c;
 }
 
-int16_t modfield_from_keysym(xcb_keysym_t keysym)
+void destroy_chunks(chunk_t *chunk)
 {
+    chunk_t *c = chunk;
+    while (c != NULL) {
+        chunk_t *next = c->next;
+        free(c);
+        c = next;
+    }
+}
+
+bool parse_chain(char *string, chain_t *chain)
+{
+    char chord[MAXLEN] = {0};
+    char name[MAXLEN] = {0};
+    xcb_keysym_t keysym = XCB_NO_SYMBOL;
+    xcb_button_t button = XCB_NONE;
     uint16_t modfield = 0;
-    xcb_keycode_t *keycodes = NULL, *mod_keycodes = NULL;
-    xcb_get_modifier_mapping_reply_t *reply = NULL;
-    if ((keycodes = keycodes_from_keysym(keysym)) != NULL) {
-        if ((reply = xcb_get_modifier_mapping_reply(dpy, xcb_get_modifier_mapping(dpy), NULL)) != NULL) {
-            if ((mod_keycodes = xcb_get_modifier_mapping_keycodes(reply)) != NULL) {
-                unsigned int num_mod = xcb_get_modifier_mapping_keycodes_length(reply) / reply->keycodes_per_modifier;
-                for (unsigned int i = 0; i < num_mod; i++) {
-                    for (unsigned int j = 0; j < reply->keycodes_per_modifier; j++) {
-                        xcb_keycode_t mk = mod_keycodes[i * reply->keycodes_per_modifier + j];
-                        if (mk == XCB_NO_SYMBOL)
-                            continue;
-                        for (xcb_keycode_t *k = keycodes; *k != XCB_NO_SYMBOL; k++)
-                            if (*k == mk)
-                                modfield |= (1 << i);
-                    }
-                }
-
+    uint8_t event_type = XCB_KEY_PRESS;
+    bool replay_event = false;
+    char *outer_advance;
+    char *inner_advance;
+    for (outer_advance = get_token(chord, string, LNK_SEP); chord[0] != '\0'; outer_advance = get_token(chord, outer_advance, LNK_SEP)) {
+        for (inner_advance = get_token(name, chord, SYM_SEP); name[0] != '\0'; inner_advance = get_token(name, inner_advance, SYM_SEP)) {
+            int offset = 0;
+            if (name[0] == RELEASE_PREFIX) {
+                event_type = XCB_KEY_RELEASE;
+                offset++;
+            } else if (name[0] == MOTION_PREFIX) {
+                event_type = XCB_MOTION_NOTIFY;
+                offset++;
+            } else if (name[0] == REPLAY_PREFIX) {
+                replay_event = true;
+                offset++;
+            }
+            char *nm = name + offset;
+            if (!parse_modifier(nm, &modfield) && !parse_keysym(nm, &keysym) && !parse_button(nm, &button)) {
+                warn("Unknown name: '%s'.\n", nm);
+                return false;
             }
         }
-    }
-    free(keycodes);
-    free(reply);
-    return modfield;
-}
-
-xcb_keycode_t *keycodes_from_keysym(xcb_keysym_t keysym)
-{
-    xcb_setup_t const *setup;
-    unsigned int num = 0;
-    xcb_keycode_t *result = NULL, *result_np = NULL;
-
-    if ((setup = xcb_get_setup(dpy)) != NULL) {
-        xcb_keycode_t min_kc = setup->min_keycode;
-        xcb_keycode_t max_kc = setup->max_keycode;
-        /* We must choose a type for kc other than xcb_keycode_t whose size is 1, otherwise, since max_kc will most likely be 255, if kc == 255, kc++ would be 0 and the outer loop would start over ad infinitum */
-        for(unsigned int kc = min_kc; kc <= max_kc; kc++)
-            for(unsigned int col = 0; col < KEYSYMS_PER_KEYCODE; col++) {
-                xcb_keysym_t ks = xcb_key_symbols_get_keysym(symbols, kc, col);
-                if (ks == keysym) {
-                    num++;
-                    result_np = realloc(result, sizeof(xcb_keycode_t) * (num + 1));
-                    if (result_np == NULL) {
-                        free(result);
-                        return NULL;
-                    }
-                    result = result_np;
-                    result[num - 1] = kc;
-                    result[num] = XCB_NO_SYMBOL;
-                    break;
-                }
-            }
-    }
-    return result;
-}
-
-bool parse_hotkey(char *string, xcb_keysym_t *keysym, xcb_button_t *button, uint16_t *modfield, uint8_t *event_type, bool *replay_event) {
-    char backup[MAXLEN];
-    strncpy(backup, string, sizeof(backup));
-    backup[strlen(string)] = '\0';
-    for (char *name = strtok(string, TOK_SEP); name != NULL; name = strtok(NULL, TOK_SEP)) {
-        if (name[0] == RELEASE_PREFIX) {
-            *event_type = XCB_KEY_RELEASE;
-            name++;
-        } else if (name[0] == MOTION_PREFIX) {
-            *event_type = XCB_MOTION_NOTIFY;
-            name++;
-        } else if (name[0] == REPLAY_PREFIX) {
-            *replay_event = true;
-            name++;
-        }
-        if (!parse_modifier(name, modfield) && !parse_keysym(name, keysym) && !parse_button(name, button)) {
-            warn("Unrecognized key name: '%s'.\n", name);
-        }
-    }
-    if (*keysym == XCB_NO_SYMBOL && *button == XCB_NONE) {
-        warn("Invalid hotkey: '%s'.\n", backup);
-        return false;
+        if (button != XCB_NONE)
+            event_type = key_to_button(event_type);
+        chord_t *c = make_chord(keysym, button, modfield, event_type, replay_event);
+        add_chord(chain, c);
+        keysym = XCB_NO_SYMBOL;
+        button = XCB_NONE;
+        modfield = 0;
+        event_type = XCB_KEY_PRESS;
+        replay_event = false;
     }
     return true;
 }
@@ -2503,7 +2655,7 @@ bool parse_keysym(char *name, xcb_keysym_t *keysym)
 bool parse_button(char *name, xcb_button_t *butidx)
 {
     /* X handles up to 24 buttons */
-    return (sscanf(name, "button%hhu", butidx) == 1);
+    return (sscanf(name, "button%" SCNu8, butidx) == 1);
 }
 
 bool parse_modifier(char *name, uint16_t *modfield)
@@ -2597,128 +2749,68 @@ void get_lock_fields(void)
     PRINTF("lock fields %u %u %u\n", num_lock, caps_lock, scroll_lock);
 }
 
-bool extract_sequence(char *string, char *prefix, char *sequence, char *suffix)
+int16_t modfield_from_keysym(xcb_keysym_t keysym)
 {
-    char *begin = strchr(string, SEQ_BEGIN);
-    char *end = strrchr(string, SEQ_END);
-    if (begin == NULL || end == NULL || ((end - begin - 1) < SEQ_MIN_LEN))
-        return false;
-    strncpy(sequence, begin + 1, end - begin - 1);
-    strncpy(prefix, string, begin - string);
-    strncpy(suffix, end + 1, strlen(string) - (1 + end - string));
-    sequence[end - begin - 1] = '\0';
-    prefix[begin - string] = '\0';
-    suffix[strlen(string) - (1 + end - string)] = '\0';
-    return true;
-}
-
-void unfold_hotkeys(char *folded_hotkey, char *folded_command)
-{
-    char hotkey_sequence[MAXLEN];
-    char hotkey_prefix[MAXLEN];
-    char hotkey_suffix[MAXLEN];
-    char command_sequence[MAXLEN];
-    char command_prefix[MAXLEN];
-    char command_suffix[MAXLEN];
-    if (!extract_sequence(folded_hotkey, hotkey_prefix, hotkey_sequence, hotkey_suffix) || !extract_sequence(folded_command, command_prefix, command_sequence, command_suffix)) {
-        warn("Couldn't extract sequence from '%s' or '%s'.\n", folded_hotkey, folded_command);
-        return;
-    }
-    char unfolded_hotkey[MAXLEN], unfolded_command[MAXLEN];
-    xcb_keysym_t keysym = XCB_NO_SYMBOL;
-    xcb_button_t button = XCB_NONE;
     uint16_t modfield = 0;
-    uint8_t event_type = XCB_KEY_PRESS;
-    bool replay_event = false;
-    char *hk_ptr, *cmd_ptr;
-    char hk_a = 1, hk_z = 0, cmd_a = 1, cmd_z = 0;
-    char *hk_item = strtok_r(hotkey_sequence, SEQ_SEP, &hk_ptr);
-    char *cmd_item = strtok_r(command_sequence, SEQ_SEP, &cmd_ptr);
-
-    while ((hk_item != NULL || hk_a <= hk_z) && (cmd_item != NULL || cmd_a <= cmd_z)) {
-#define PREGEN(elt, ra, rz, prefix, suffix, unf) \
-        if (ra > rz && strlen(elt) == 3 && sscanf(elt, "%c-%c", &ra, &rz) == 2 && ra >= rz) \
-            ra = 1, rz = 0; \
-        if (ra <= rz) \
-            snprintf(unf, sizeof(unf), "%s%c%s", prefix, ra, suffix); \
-        else \
-            snprintf(unf, sizeof(unf), "%s%s%s", prefix, elt, suffix);
-        PREGEN(hk_item, hk_a, hk_z, hotkey_prefix, hotkey_suffix, unfolded_hotkey)
-        PREGEN(cmd_item, cmd_a, cmd_z, command_prefix, command_suffix, unfolded_command)
-#undef PREGEN
-
-        if (parse_hotkey(unfolded_hotkey, &keysym, &button, &modfield, &event_type, &replay_event))
-            generate_hotkeys(keysym, button, modfield, event_type, replay_event, unfolded_command);
-
-        keysym = XCB_NO_SYMBOL;
-        button = XCB_NONE;
-        modfield = 0;
-        event_type = XCB_KEY_PRESS;
-        replay_event = false;
-
-#define POSTGEN(elt, ra, rz, ptr) \
-        if (ra >= rz) \
-            elt = strtok_r(NULL, SEQ_SEP, &ptr), ra = 1, rz = 0; \
-        else \
-            ra++;
-        POSTGEN(hk_item, hk_a, hk_z, hk_ptr)
-        POSTGEN(cmd_item, cmd_a, cmd_z, cmd_ptr)
-#undef POSTGEN
+    xcb_keycode_t *keycodes = NULL;
+    if ((keycodes = keycodes_from_keysym(keysym)) != NULL) {
+        for (xcb_keycode_t *k = keycodes; *k != XCB_NO_SYMBOL; k++)
+            modfield |= modfield_from_keycode(*k);
     }
+    free(keycodes);
+    return modfield;
 }
 
-void generate_hotkeys(xcb_keysym_t keysym, xcb_button_t button, uint16_t modfield, uint8_t event_type, bool replay_event, char *command)
+int16_t modfield_from_keycode(xcb_keycode_t keycode)
 {
-    if (button == XCB_NONE) {
-        xcb_keycode_t *keycodes = keycodes_from_keysym(keysym);
-        if (keycodes != NULL)
-            for (xcb_keycode_t *kc = keycodes; *kc != XCB_NO_SYMBOL; kc++) {
-                xcb_keysym_t natural_keysym = xcb_key_symbols_get_keysym(symbols, *kc, 0);
-                for (unsigned char col = 0; col < KEYSYMS_PER_KEYCODE; col++) {
-                    xcb_keysym_t ks = xcb_key_symbols_get_keysym(symbols, *kc, col);
-                    if (ks == keysym) {
-                        uint16_t implicit_modfield = (col & 1 ? XCB_MOD_MASK_SHIFT : 0) | (col & 2 ? modfield_from_keysym(Mode_switch) : 0);
-                        uint16_t explicit_modfield = modfield | implicit_modfield;
-                        hotkey_t *hk = make_hotkey(natural_keysym, button, explicit_modfield, event_type, replay_event, command);
-                        add_hotkey(hk);
-                        break;
-                    }
+    uint16_t modfield = 0;
+    xcb_keycode_t *mod_keycodes = NULL;
+    xcb_get_modifier_mapping_reply_t *reply = NULL;
+    if ((reply = xcb_get_modifier_mapping_reply(dpy, xcb_get_modifier_mapping(dpy), NULL)) != NULL) {
+        if ((mod_keycodes = xcb_get_modifier_mapping_keycodes(reply)) != NULL) {
+            unsigned int num_mod = xcb_get_modifier_mapping_keycodes_length(reply) / reply->keycodes_per_modifier;
+            for (unsigned int i = 0; i < num_mod; i++) {
+                for (unsigned int j = 0; j < reply->keycodes_per_modifier; j++) {
+                    xcb_keycode_t mkc = mod_keycodes[i * reply->keycodes_per_modifier + j];
+                    if (mkc == XCB_NO_SYMBOL)
+                        continue;
+                    if (keycode == mkc)
+                        modfield |= (1 << i);
                 }
             }
-        free(keycodes);
-    } else {
-        hotkey_t *hk = make_hotkey(keysym, button, modfield, event_type, replay_event, command);
-        add_hotkey(hk);
+
+        }
     }
+    free(reply);
+    return modfield;
 }
 
-hotkey_t *make_hotkey(xcb_keysym_t keysym, xcb_button_t button, uint16_t modfield, uint8_t event_type, bool replay_event, char *command)
+xcb_keycode_t *keycodes_from_keysym(xcb_keysym_t keysym)
 {
-    PRINTF("hotkey %u %u %u %u %s\n", keysym, button, modfield, event_type, command);
-    hotkey_t *hk = malloc(sizeof(hotkey_t));
-    hk->keysym = keysym;
-    hk->button = button;
-    hk->modfield = modfield;
-    if (button != XCB_NONE)
-        hk->event_type = key_to_button(event_type);
-    else
-        hk->event_type = event_type;
-    hk->replay_event = replay_event;
-    strncpy(hk->command, command, sizeof(hk->command));
-    hk->next = NULL;
-    return hk;
-}
+    xcb_setup_t const *setup;
+    unsigned int num = 0;
+    xcb_keycode_t *result = NULL, *result_np = NULL;
 
-hotkey_t *find_hotkey(xcb_keysym_t keysym, xcb_button_t button, uint16_t modfield, uint8_t event_type)
-{
-    for (hotkey_t *hk = hotkeys; hk != NULL; hk = hk->next)
-        if (hk->event_type == event_type && hk->keysym == keysym && hk->button == button && hk->modfield == modfield)
-            return hk;
-    return NULL;
-}
-
-void add_hotkey(hotkey_t *hk)
-{
-    hk->next = hotkeys;
-    hotkeys = hk;
+    if ((setup = xcb_get_setup(dpy)) != NULL) {
+        xcb_keycode_t min_kc = setup->min_keycode;
+        xcb_keycode_t max_kc = setup->max_keycode;
+        /* We must choose a type for kc other than xcb_keycode_t whose size is 1, otherwise, since max_kc will most likely be 255, if kc == 255, kc++ would be 0 and the outer loop would start over ad infinitum */
+        for(unsigned int kc = min_kc; kc <= max_kc; kc++)
+            for(unsigned int col = 0; col < KEYSYMS_PER_KEYCODE; col++) {
+                xcb_keysym_t ks = xcb_key_symbols_get_keysym(symbols, kc, col);
+                if (ks == keysym) {
+                    num++;
+                    result_np = realloc(result, sizeof(xcb_keycode_t) * (num + 1));
+                    if (result_np == NULL) {
+                        free(result);
+                        return NULL;
+                    }
+                    result = result_np;
+                    result[num - 1] = kc;
+                    result[num] = XCB_NO_SYMBOL;
+                    break;
+                }
+            }
+    }
+    return result;
 }
