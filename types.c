@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include "types.h"
 #include "parse.h"
+#include "grab.h"
 
 hotkey_t *find_hotkey(xcb_keysym_t keysym, xcb_button_t button, uint16_t modfield, uint8_t event_type, bool *replay_event)
 {
@@ -14,6 +15,15 @@ hotkey_t *find_hotkey(xcb_keysym_t keysym, xcb_button_t button, uint16_t modfiel
         if (chained && c->state == c->head)
             continue;
         if (match_chord(c->state, event_type, keysym, button, modfield)) {
+            if (status_fifo != NULL && num_active == 0) {
+                if (!chained) {
+                    strncpy(progress, c->state->repr, sizeof(progress));
+                } else {
+                    strncat(progress, LNK_SEP, sizeof(progress) - strlen(progress) - 1);
+                    strncat(progress, c->state->repr, sizeof(progress) - strlen(progress) - 1);
+                }
+                put_status(HOTKEY_PREFIX, progress);
+            }
             if (replay_event != NULL && c->state->replay_event)
                 *replay_event = true;
             if (c->state == c->tail) {
@@ -23,6 +33,7 @@ hotkey_t *find_hotkey(xcb_keysym_t keysym, xcb_button_t button, uint16_t modfiel
             } else {
                 c->state = c->state->next;
                 num_active++;
+                grab_chord(c->state);
             }
         } else if (chained) {
             if (c->state->event_type == event_type)
@@ -37,14 +48,6 @@ hotkey_t *find_hotkey(xcb_keysym_t keysym, xcb_button_t button, uint16_t modfiel
             chained = true;
             if (timeout > 0)
                 alarm(timeout);
-        } else {
-            *replay_event = true;
-            for (hotkey_t *hk = hotkeys; *replay_event && hk != NULL; hk = hk->next) {
-                chord_t *c = hk->chain->head;
-                for (chord_t *cc = c; cc != NULL; cc = cc->more)
-                    if (cc->keysym == keysym && cc->button == button && cc->modfield == modfield)
-                        *replay_event = false;
-            }
         }
     } else if (num_active == 0) {
         abort_chain();
@@ -83,8 +86,10 @@ chord_t *make_chord(xcb_keysym_t keysym, xcb_button_t button, uint16_t modfield,
                         for (chord_t *c = orig; unique && c != NULL; c = c->more)
                             if (c->modfield == explicit_modfield && c->keysym == natural_keysym)
                                 unique = false;
-                        if (!unique)
+                        if (!unique) {
+                            free(chord);
                             break;
+                        }
                         chord->keysym = natural_keysym;
                         chord->button = button;
                         chord->modfield = explicit_modfield;
@@ -160,6 +165,8 @@ void abort_chain(void)
     chained = false;
     if (timeout > 0)
         alarm(0);
+    ungrab();
+    grab();
 }
 
 void destroy_chain(chain_t *chain)
