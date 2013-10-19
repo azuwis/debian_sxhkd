@@ -1,9 +1,32 @@
+/* * Copyright (c) 2013 Bastien Dejean
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without modification,
+ * are permitted provided that the following conditions are met:
+ *
+ *  * Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *  * Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation and/or
+ * other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS ``AS IS''
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
 #include <ctype.h>
 #include "locales.h"
-#include "types.h"
 #include "parse.h"
 
 keysym_dict_t nks_dict[] = {/*{{{*/
@@ -2338,16 +2361,16 @@ keysym_dict_t nks_dict[] = {/*{{{*/
 #endif
 };/*}}}*/
 
-void load_config(char *config_file)
+void load_config(const char *config_file)
 {
     PRINTF("load configuration '%s'\n", config_file);
     FILE *cfg = fopen(config_file, "r");
     if (cfg == NULL)
         err("Can't open configuration file: '%s'.\n", config_file);
 
-    char buf[MAXLEN];
+    char buf[3 * MAXLEN];
     char chain[MAXLEN] = {0};
-    char command[MAXLEN] = {0};
+    char command[2 * MAXLEN] = {0};
     int offset = 0;
     char first;
 
@@ -2363,9 +2386,9 @@ void load_config(char *config_file)
             *(end + 1) = '\0';
 
             if (isgraph(first))
-                strncpy(chain + offset, start, sizeof(chain) - offset);
+                snprintf(chain + offset, sizeof(chain) - offset, "%s", start);
             else
-                strncpy(command + offset, start, sizeof(command) - offset);
+                snprintf(command + offset, sizeof(command) - offset, "%s", start);
 
             if (*end == PARTIAL_LINE) {
                 offset += end - start;
@@ -2385,7 +2408,8 @@ void load_config(char *config_file)
     fclose(cfg);
 }
 
-void parse_event(xcb_generic_event_t *evt, uint8_t event_type, xcb_keysym_t *keysym, xcb_button_t *button, uint16_t *modfield) {
+void parse_event(xcb_generic_event_t *evt, uint8_t event_type, xcb_keysym_t *keysym, xcb_button_t *button, uint16_t *modfield)
+{
     if (event_type == XCB_KEY_PRESS) {
         xcb_key_press_event_t *e = (xcb_key_press_event_t *) evt;
         xcb_keycode_t keycode = e->detail;
@@ -2414,13 +2438,15 @@ void parse_event(xcb_generic_event_t *evt, uint8_t event_type, xcb_keysym_t *key
 void process_hotkey(char *hotkey_string, char *command_string)
 {
     char hotkey[MAXLEN] = {0};
-    char command[MAXLEN] = {0};
+    char command[2 * MAXLEN] = {0};
+    char last_hotkey[MAXLEN] = {0};
+    unsigned char num_same = 0;
     chunk_t *hk_chunks = extract_chunks(hotkey_string);
     chunk_t *cm_chunks = extract_chunks(command_string);
     if (hk_chunks == NULL)
-        strncpy(hotkey, hotkey_string, sizeof(hotkey));
+        snprintf(hotkey, sizeof(hotkey), "%s", hotkey_string);
     if (cm_chunks == NULL)
-        strncpy(command, command_string, sizeof(command));
+        snprintf(command, sizeof(command), "%s", command_string);
     render_next(hk_chunks, hotkey);
     render_next(cm_chunks, command);
 
@@ -2431,6 +2457,8 @@ void process_hotkey(char *hotkey_string, char *command_string)
         if (parse_chain(hotkey, chain)) {
             hotkey_t *hk = make_hotkey(chain, command);
             add_hotkey(hk);
+            if (strcmp(hotkey, last_hotkey) == 0)
+                num_same++;
         } else {
             free(chain);
         }
@@ -2438,19 +2466,29 @@ void process_hotkey(char *hotkey_string, char *command_string)
         if (hk_chunks == NULL && cm_chunks == NULL)
             break;
 
+        snprintf(last_hotkey, sizeof(last_hotkey), "%s", hotkey);
+
         render_next(hk_chunks, hotkey);
         render_next(cm_chunks, command);
     }
+
+    if (num_same > 0) {
+        int period = num_same + 1;
+        int delay = num_same;
+        for (hotkey_t *hk = hotkeys_tail; hk != NULL && delay >= 0; hk = hk->prev, delay--)
+            hk->cycle = make_cycle(delay, period);
+    }
+
     if (hk_chunks != NULL)
         destroy_chunks(hk_chunks);
     if (cm_chunks != NULL)
         destroy_chunks(cm_chunks);
 }
 
-char *get_token(char *dst, char *src, char *sep)
+char *get_token(char *dst, char *ign, char *src, char *sep)
 {
     size_t len = strlen(src);
-    unsigned int i = 0, j = 0;
+    unsigned int i = 0, j = 0, k = 0;
     bool inhibit = false;
     bool found = false;
     while (i < len && !found) {
@@ -2465,6 +2503,8 @@ char *get_token(char *dst, char *src, char *sep)
             if (j > 0)
                 found = true;
             do {
+                if (ign != NULL)
+                    ign[k++] = src[i];
                 i++;
             } while (i < len && strchr(sep, src[i]) != NULL);
             i--;
@@ -2474,6 +2514,8 @@ char *get_token(char *dst, char *src, char *sep)
         i++;
     }
     dst[j] = '\0';
+    if (ign != NULL)
+        ign[k] = '\0';
     return src + i;
 }
 
@@ -2495,12 +2537,12 @@ void render_next(chunk_t *chunks, char *dest)
             }
             if (c->advance == NULL) {
                 incr = true;
-                c->advance = get_token(c->item, c->text, SEQ_SEP);
+                c->advance = get_token(c->item, NULL, c->text, SEQ_SEP);
             } else if (!incr && c->range_cur > c->range_max) {
                 if (c->advance[0] == '\0') {
-                    c->advance = get_token(c->item, c->text, SEQ_SEP);
+                    c->advance = get_token(c->item, NULL, c->text, SEQ_SEP);
                 } else {
-                    c->advance = get_token(c->item, c->advance, SEQ_SEP);
+                    c->advance = get_token(c->item, NULL, c->advance, SEQ_SEP);
                     incr = true;
                 }
             }
@@ -2601,15 +2643,17 @@ bool parse_chain(char *string, chain_t *chain)
 {
     char chord[MAXLEN] = {0};
     char name[MAXLEN] = {0};
+    char ignored[MAXLEN] = {0};
     xcb_keysym_t keysym = XCB_NO_SYMBOL;
     xcb_button_t button = XCB_NONE;
     uint16_t modfield = 0;
     uint8_t event_type = XCB_KEY_PRESS;
     bool replay_event = false;
+    bool lock_chain = false;
     char *outer_advance;
     char *inner_advance;
-    for (outer_advance = get_token(chord, string, LNK_SEP); chord[0] != '\0'; outer_advance = get_token(chord, outer_advance, LNK_SEP)) {
-        for (inner_advance = get_token(name, chord, SYM_SEP); name[0] != '\0'; inner_advance = get_token(name, inner_advance, SYM_SEP)) {
+    for (outer_advance = get_token(chord, ignored, string, LNK_SEP); chord[0] != '\0'; outer_advance = get_token(chord, ignored, outer_advance, LNK_SEP)) {
+        for (inner_advance = get_token(name, NULL, chord, SYM_SEP); name[0] != '\0'; inner_advance = get_token(name, NULL, inner_advance, SYM_SEP)) {
             int offset = 0;
             if (name[0] == RELEASE_PREFIX) {
                 event_type = XCB_KEY_RELEASE;
@@ -2627,19 +2671,20 @@ bool parse_chain(char *string, chain_t *chain)
                 return false;
             }
         }
+        if (strstr(ignored, GRP_SEP) != NULL)
+            lock_chain = true;
         if (button != XCB_NONE)
             event_type = key_to_button(event_type);
-        chord_t *c = make_chord(keysym, button, modfield, event_type, replay_event);
+        chord_t *c = make_chord(keysym, button, modfield, event_type, replay_event, lock_chain);
         add_chord(chain, c);
-        if (status_fifo != NULL) {
-            strncpy(c->repr, chord, sizeof(c->repr));
-            c->repr[strlen(chord)] = '\0';
-        }
+        if (status_fifo != NULL)
+            snprintf(c->repr, sizeof(c->repr), "%s", chord);
         keysym = XCB_NO_SYMBOL;
         button = XCB_NONE;
         modfield = 0;
         event_type = XCB_KEY_PRESS;
         replay_event = false;
+        lock_chain = false;
     }
     return true;
 }
@@ -2710,8 +2755,7 @@ bool parse_modifier(char *name, uint16_t *modfield)
 bool parse_fold(char *string, char *folded_string)
 {
     if (strchr(string, SEQ_BEGIN) != NULL && strrchr(string, SEQ_END) != NULL) {
-        strncpy(folded_string, string, strlen(string));
-        folded_string[strlen(string)] = '\0';
+        snprintf(folded_string, strlen(string), "%s", string);
         return true;
     }
     return false;

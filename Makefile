@@ -1,5 +1,5 @@
 NAME    = sxhkd
-VERSION = 0.4.1
+VERSION = 0.5.2
 
 CC      ?= gcc
 LIBS     = -lm -lxcb -lxcb-keysyms
@@ -26,7 +26,7 @@ include Sourcedeps
 $(OBJ): Makefile
 
 .c.o:
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(OPTFLAGS) -c -o $@ $<
 
 $(NAME): $(OBJ)
 	$(CC) -o $@ $(OBJ) $(LDFLAGS) $(LIBS)
