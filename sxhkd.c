@@ -1,19 +1,37 @@
-#include <xcb/xcb_keysyms.h>
+/* * Copyright (c) 2013 Bastien Dejean
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without modification,
+ * are permitted provided that the following conditions are met:
+ *
+ *  * Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *  * Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation and/or
+ * other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS ``AS IS''
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include <xcb/xcb_event.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <sys/select.h>
 #include <fcntl.h>
-#include <ctype.h>
-#include <getopt.h>
 #include <signal.h>
 #include <stdbool.h>
-#include "helpers.h"
-#include "types.h"
 #include "parse.h"
 #include "grab.h"
 #include "sxhkd.h"
@@ -24,9 +42,10 @@ int main(int argc, char *argv[])
     char *fifo_path = NULL;
     status_fifo = NULL;
     config_path = NULL;
+    ignore_mapping = false;
     timeout = TIMEOUT;
 
-    while ((opt = getopt(argc, argv, "vht:c:r:s:")) != -1) {
+    while ((opt = getopt(argc, argv, "vhnt:c:r:s:")) != -1) {
         switch (opt) {
             case 'v':
                 printf("%s\n", VERSION);
@@ -35,6 +54,9 @@ int main(int argc, char *argv[])
             case 'h':
                 printf("sxhkd [-h|-v|-t TIMEOUT|-c CONFIG_FILE|-r REDIR_FILE|-s STATUS_FIFO] [EXTRA_CONFIG ...]\n");
                 exit(EXIT_SUCCESS);
+                break;
+            case 'n':
+                ignore_mapping = true;
                 break;
             case 't':
                 timeout = atoi(optarg);
@@ -63,7 +85,7 @@ int main(int argc, char *argv[])
         else
             snprintf(config_file, sizeof(config_file), "%s/%s/%s", getenv("HOME"), ".config", CONFIG_PATH);
     } else {
-        strncpy(config_file, config_path, sizeof(config_file));
+        snprintf(config_file, sizeof(config_file), "%s", config_path);
     }
 
     if (fifo_path != NULL) {
@@ -83,6 +105,7 @@ int main(int argc, char *argv[])
     setup();
     get_standard_keysyms();
     get_lock_fields();
+    escape_chord = make_chord(ESCAPE_KEYSYM, XCB_NONE, 0, XCB_KEY_PRESS, false, false);
     load_config(config_file);
     for (int i = 0; i < num_extra_confs; i++)
         load_config(extra_confs[i]);
@@ -93,7 +116,7 @@ int main(int argc, char *argv[])
 
     fd_set descriptors;
 
-    reload = bell = chained = false;
+    reload = bell = chained = locked = false;
     running = true;
 
     xcb_flush(dpy);
@@ -114,6 +137,9 @@ int main(int argc, char *argv[])
                         break;
                     case XCB_MOTION_NOTIFY:
                         motion_notify(evt, event_type);
+                        break;
+                    case XCB_MAPPING_NOTIFY:
+                        mapping_notify(evt);
                         break;
                     default:
                         PRINTF("received event %u\n", event_type);
@@ -149,6 +175,7 @@ int main(int argc, char *argv[])
         fclose(status_fifo);
     ungrab();
     cleanup();
+    destroy_chord(escape_chord);
     xcb_key_symbols_free(symbols);
     xcb_disconnect(dpy);
     return EXIT_SUCCESS;
@@ -204,9 +231,26 @@ void motion_notify(xcb_generic_event_t *evt, uint8_t event_type)
     }
     hotkey_t *hk = find_hotkey(XCB_NO_SYMBOL, button, modfield, event_type, NULL);
     if (hk != NULL) {
-        char command[MAXLEN];
+        char command[2 * MAXLEN];
         snprintf(command, sizeof(command), hk->command, e->root_x, e->root_y);
         run(command);
+    }
+}
+
+
+void mapping_notify(xcb_generic_event_t *evt)
+{
+    if (ignore_mapping || !running || chained)
+        return;
+    xcb_mapping_notify_event_t *e = (xcb_mapping_notify_event_t *) evt;
+    PRINTF("mapping notify %u %u\n", e->request, e->count);
+    if (e->request == XCB_MAPPING_POINTER)
+        return;
+    if (xcb_refresh_keyboard_mapping(symbols, e) == 1) {
+        destroy_chord(escape_chord);
+        get_lock_fields();
+        reload_cmd();
+        escape_chord = make_chord(ESCAPE_KEYSYM, XCB_NONE, 0, XCB_KEY_PRESS, false, false);
     }
 }
 
@@ -222,21 +266,22 @@ void setup(void)
     if ((shell = getenv(SXHKD_SHELL_ENV)) == NULL && (shell = getenv(SHELL_ENV)) == NULL)
         err("The '%s' environment variable is not defined.\n", SHELL_ENV);
     symbols = xcb_key_symbols_alloc(dpy);
-    hotkeys = hotkeys_tail = NULL;
+    hotkeys_head = hotkeys_tail = NULL;
     progress[0] = '\0';
 }
 
 void cleanup(void)
 {
     PUTS("cleanup");
-    hotkey_t *hk = hotkeys;
+    hotkey_t *hk = hotkeys_head;
     while (hk != NULL) {
-        hotkey_t *tmp = hk->next;
+        hotkey_t *next = hk->next;
         destroy_chain(hk->chain);
+        free(hk->cycle);
         free(hk);
-        hk = tmp;
+        hk = next;
     }
-    hotkeys = hotkeys_tail = NULL;
+    hotkeys_head = hotkeys_tail = NULL;
 }
 
 void reload_cmd(void)
@@ -260,7 +305,7 @@ void hold(int sig)
         bell = true;
 }
 
-void put_status(char c, char *s)
+void put_status(char c, const char *s)
 {
     fprintf(status_fifo, "%c%s\n", c, s);
     fflush(status_fifo);
