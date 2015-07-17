@@ -1,0 +1,17 @@
+Source: sxhkd
+Section: x11
+Priority: extra
+Maintainer: Zhong Jianxin <azuwis@gmail.com>
+Build-Depends: debhelper (>=9),
+               libxcb1-dev,
+               libxcb-util0-dev,
+               libxcb-keysyms1-dev
+Standards-Version: 3.9.6
+Homepage: https://github.com/baskerville/sxhkd
+
+Package: sxhkd
+Architecture: any
+Multi-Arch: foreign
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: Simple X hotkey daemon
+  A simple X hotkey daemon with a powerful and compact configuration syntax.
